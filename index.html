@@ -149,6 +149,11 @@
   .st-pendiente{background:rgba(217,100,95,.14);color:var(--bad);}
   .st-excedente{background:rgba(224,168,56,.14);color:var(--warn);}
   .st-ok{background:rgba(76,175,130,.14);color:var(--ok);}
+  .nc-tag{
+    display:inline-block;font-family:var(--mono);font-size:9.5px;font-weight:700;
+    padding:1px 5px;border-radius:4px;background:rgba(159,122,234,.16);color:#b39ddb;
+    letter-spacing:.03em;vertical-align:middle;
+  }
   .fletero-name{font-weight:600;font-size:12px;}
   .ref-cell{font-size:11.5px;line-height:1.35;}
   .ref-cell .num-part{font-family:var(--mono);color:var(--text);}
@@ -351,9 +356,29 @@ async function processAllFiles(){
 }
 
 function parseSheet(rows, out){
-  let currentFletero = null;
-  // map: fletero -> folio -> {facturado, pagado, uuid, diarios:[], egresos:[]}
+  // Primero: localizar todos los renglones "Cuenta : ..." en la hoja, sin importar su posición
+  // (algunos reportes lo ponen al inicio del bloque, otros al final, como pie de página).
+  const headers = [];
+  for(let i=0;i<rows.length;i++){
+    const r = rows[i] || [];
+    if(r[0] === '-' && typeof r[1] === 'string' && /cuenta/i.test(r[1])){
+      headers.push({ index:i, name: extractFleteroName(r[1]) });
+    }
+  }
+
+  // map: fletero -> folio -> {facturado, pagado, uuid, diarios:[], egresos:[], esNotaCredito}
   const localMap = {};
+
+  function fleteroForRow(i){
+    if(headers.length === 0) return null;
+    if(headers.length === 1) return headers[0].name; // un solo fletero en la hoja: aplica a todo el bloque
+    // varios encabezados: usa el header más cercano (el que ya pasó, si existe; si no, el siguiente)
+    let applicable = null;
+    for(const h of headers){ if(h.index <= i) applicable = h.name; }
+    if(applicable) return applicable;
+    const next = headers.find(h=>h.index > i);
+    return next ? next.name : headers[headers.length-1].name;
+  }
 
   for(let i=0;i<rows.length;i++){
     const r = rows[i] || [];
@@ -365,24 +390,23 @@ function parseSheet(rows, out){
     const colG = num(r[6]); // Debe
     const colH = num(r[7]); // Haber
 
-    // Detect account header row: Col A === '-' and Col B contains "Cuenta"
-    if(colA === '-' && typeof colB === 'string' && /cuenta/i.test(colB)){
-      currentFletero = extractFleteroName(colB);
-      continue;
-    }
+    if(colA === '-' && typeof colB === 'string' && /cuenta/i.test(colB)) continue; // ya procesado arriba
 
-    if(!currentFletero) continue;
     if(colB !== 'Dr' && colB !== 'Eg') continue;
     if(!colE || typeof colE !== 'string') continue;
+
+    const currentFletero = fleteroForRow(i);
+    if(!currentFletero) continue;
 
     const parsed = parseConcepto(colE);
     if(!parsed.folio) continue;
 
     if(!localMap[currentFletero]) localMap[currentFletero] = {};
     if(!localMap[currentFletero][parsed.folio]){
-      localMap[currentFletero][parsed.folio] = {facturado:0, pagado:0, uuid:'', diarios:[], egresos:[]};
+      localMap[currentFletero][parsed.folio] = {facturado:0, pagado:0, uuid:'', diarios:[], egresos:[], esNotaCredito:false};
     }
     const entry = localMap[currentFletero][parsed.folio];
+    if(parsed.esNotaCredito) entry.esNotaCredito = true;
     const numero = colC !== null && colC !== undefined ? String(colC).trim() : '';
     const fecha = colD !== null && colD !== undefined ? String(colD).trim() : '';
 
@@ -411,6 +435,7 @@ function parseSheet(rows, out){
         egresos: e.egresos,
         facturado: e.facturado,
         pagado: e.pagado,
+        esNotaCredito: e.esNotaCredito,
         diferencia: round2(e.facturado - e.pagado)
       });
     });
@@ -428,12 +453,29 @@ function extractFleteroName(text){
 
 function parseConcepto(text){
   const t = text.trim();
+  const uuidRe = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
   const uuidMatch = t.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
   const tokens = t.split(/\s+/);
-  const folio = tokens[0] || '';
+  let folio = '';
+  let esNotaCredito = false;
+
+  if(tokens[0] && uuidRe.test(tokens[0])){
+    // Nota de crédito en el DIARIO: "<uuid> <folio> <nombre...>" (monto en Haber viene negativo)
+    folio = tokens[1] || '';
+    esNotaCredito = true;
+  } else if(/^NC-/i.test(tokens[0] || '')){
+    // Nota de crédito en el EGRESO: "NC-<folio> <nombre...>" (monto en Debe viene negativo)
+    folio = tokens[0].replace(/^NC-/i, '');
+    esNotaCredito = true;
+  } else {
+    // Formato normal: "<folio> <nombre...> [<uuid>]"
+    folio = tokens[0] || '';
+  }
+
   return {
     folio: folio,
-    uuid: uuidMatch ? uuidMatch[0] : ''
+    uuid: uuidMatch ? uuidMatch[0] : '',
+    esNotaCredito: esNotaCredito
   };
 }
 
@@ -530,7 +572,7 @@ function renderTable(){
       }
       return `<tr>
         <td class="fletero-name">${escapeHtml(r.fletero)}</td>
-        <td class="mono">${escapeHtml(r.folio)}</td>
+        <td class="mono">${escapeHtml(r.folio)}${r.esNotaCredito ? ' <span class="nc-tag">NC</span>' : ''}</td>
         <td class="ref-cell">${refCellHtml(r.diarios)}</td>
         <td class="ref-cell">${refCellHtml(r.egresos)}</td>
         <td class="num">${money(r.facturado)}</td>
@@ -562,6 +604,7 @@ function exportReport(){
   const exportRows = recs.map(r=>({
     'Fletero': r.fletero,
     'Folio': r.folio,
+    'Nota de Crédito': r.esNotaCredito ? 'SÍ' : '',
     'Diario (No. / Fecha)': refCellText(r.diarios),
     'Egreso (No. / Fecha)': refCellText(r.egresos),
     'Folio Fiscal (UUID)': r.uuid,
@@ -571,7 +614,7 @@ function exportReport(){
     'Estatus': r.diferencia > 0.005 ? 'DEBEMOS' : (r.diferencia < -0.005 ? 'PAGO DE MAS' : 'SALDADO')
   }));
   const ws = XLSX.utils.json_to_sheet(exportRows);
-  ws['!cols'] = [{wch:32},{wch:10},{wch:22},{wch:22},{wch:38},{wch:14},{wch:14},{wch:14},{wch:14}];
+  ws['!cols'] = [{wch:32},{wch:10},{wch:12},{wch:22},{wch:22},{wch:38},{wch:14},{wch:14},{wch:14},{wch:14}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Conciliacion');
   const today = new Date().toISOString().slice(0,10);
